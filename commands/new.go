@@ -1,38 +1,136 @@
-// commands/new.go
 package commands
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"time"
+
 	"ric/dispatcher"
 )
 
-// New creates a new project from a Docker image.
-func New(inputs []string, flagArgs []string) error {
-	name, err := parseName(inputs)
+const baseURL = "http://localhost:3000"
+
+// downloadImage pulls the .tar file from the server.
+// loadImage downloads and loads a Docker image, or checks local if --local.
+func loadImage(css string, local bool) (string, error) {
+	imageName := "ri_base"
+	if css == "tailwind" {
+		imageName = "ri_tailwind"
+	}
+
+	if local {
+		fmt.Printf("Checking for local image %s...\n", imageName)
+		cmd := exec.Command("docker", "image", "inspect", imageName+":latest")
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("local image %s not found: %w", imageName, err)
+		}
+		fmt.Println("Local image found.")
+		return imageName, nil
+	}
+
+	// Download
+	url := fmt.Sprintf("%s/package?name=%s", baseURL, imageName)
+	tarPath := filepath.Join(os.TempDir(), imageName+".tar")
+
+	fmt.Printf("Downloading %s...\n", imageName)
+	resp, err := http.Get(url)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("server returned status %d", resp.StatusCode)
 	}
 
-	flags, err := parseFlags(flagArgs)
+	file, err := os.Create(tarPath)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("create file: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		return "", fmt.Errorf("save download: %w", err)
+	}
+	file.Close()
+
+	// Load into Docker
+	fmt.Printf("Loading %s into Docker...\n", imageName)
+	loadCmd := exec.Command("docker", "load", "-i", tarPath)
+	loadCmd.Stdout = os.Stdout
+	loadCmd.Stderr = os.Stderr
+	if err := loadCmd.Run(); err != nil {
+		return "", fmt.Errorf("docker load failed: %w", err)
 	}
 
-	if err := ensureRicDir(); err != nil {
-		return err
+	// Clean up
+	os.Remove(tarPath)
+
+	return imageName, nil
+}
+
+// createContainer runs the Docker container with the renamed project.
+func createContainer(name, imageName string) error {
+	fmt.Printf("Creating container %s...\n", name)
+
+	// Build the rename command: mv /workspace/railsiran /workspace/<name>
+	renameCmd := fmt.Sprintf("mv /workspace/railsiran /workspace/%s && tail -f /dev/null", name)
+
+	cmd := exec.Command(
+		"docker", "run", "-d",
+		"--name", name,
+		imageName+":latest",
+		"sh", "-c", renameCmd,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker run failed: %w", err)
 	}
 
-	fmt.Printf("Creating new project: %s\n", name)
-	if flags.css != "" {
-		fmt.Printf("  css: %s\n", flags.css)
-	}
-	if flags.local {
-		fmt.Println("  using local image")
-	}
+	fmt.Println("Waiting for container to be ready...")
+	time.Sleep(3 * time.Second)
+
+	fmt.Println("Container created.")
 	return nil
 }
+
+// copyProject copies the project from the container to ~/ric/<name>.
+func copyProject(name string) error {
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cannot get current directory: %w", err)
+	}
+
+	targetDir := filepath.Join(cwd, name)
+
+	// Check if directory already exists
+	if _, err := os.Stat(targetDir); err == nil {
+		return fmt.Errorf("directory %s already exists", targetDir)
+	}
+
+	fmt.Printf("Copying project to %s...\n", targetDir)
+
+
+	source := fmt.Sprintf("%s:/workspace/%s", name, name)
+	cmd := exec.Command("docker", "cp", "-a", source, targetDir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker cp failed: %w", err)
+	}
+
+	fmt.Println("Project copied.")
+	return nil
+}
+
 // parseName extracts and validates the project name from inputs.
 func parseName(inputs []string) (string, error) {
 	if len(inputs) != 1 {
@@ -93,6 +191,43 @@ func ensureRicDir() error {
 	if err := os.MkdirAll(ricDir, 0755); err != nil {
 		return fmt.Errorf("cannot create ~/ric: %w", err)
 	}
+	return nil
+}
+
+func New(inputs []string, flagArgs []string) error {
+	name, err := parseName(inputs)
+	if err != nil {
+		return err
+	}
+
+	flags, err := parseFlags(flagArgs)
+	if err != nil {
+		return err
+	}
+
+	if err := ensureRicDir(); err != nil {
+		return err
+	}
+
+	fmt.Printf("Creating new project: %s\n", name)
+	if flags.css != "" {
+		fmt.Printf("  css: %s\n", flags.css)
+	}
+
+	imageName, err := loadImage(flags.css, flags.local)
+	if err != nil {
+		return err
+	}
+
+	if err := createContainer(name, imageName); err != nil {
+		return err
+	}
+
+	if err := copyProject(name); err != nil {
+		return err
+	}
+
+	fmt.Printf("Project %s is ready at ~/ric/%s\n", name, name)
 	return nil
 }
 
