@@ -96,7 +96,11 @@ func createContainer(name, imageName string) (int, error) {
 
 	fmt.Printf("Creating container %s on port %d...\n", name, port)
 
-	renameCmd := fmt.Sprintf("mv /workspace/railsiran /workspace/%s && tail -f /dev/null", name)
+	renameCmd := fmt.Sprintf(
+		"if [ -d /workspace/railsiran ]; then mv /workspace/railsiran /workspace/%s; fi && tail -f /dev/null",
+		name,
+	)
+
 
 	cmd := exec.Command(
 		"docker", "run", "-d",
