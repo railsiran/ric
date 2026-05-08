@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+	"net"
 
 	"ric/dispatcher"
 )
@@ -73,16 +74,34 @@ func loadImage(css string, local bool) (string, error) {
 	return imageName, nil
 }
 
-// createContainer runs the Docker container with the renamed project.
-func createContainer(name, imageName string) error {
-	fmt.Printf("Creating container %s...\n", name)
+// findPort finds an available port starting from the given port.
+func findPort(start int) (int, error) {
+	for port := start; port < start+100; port++ {
+		addr := fmt.Sprintf(":%d", port)
+		listener, err := net.Listen("tcp", addr)
+		if err == nil {
+			listener.Close()
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no available ports found between %d and %d", start, start+100)
+}
 
-	// Build the rename command: mv /workspace/railsiran /workspace/<name>
+// createContainer runs the Docker container with the renamed project.
+func createContainer(name, imageName string) (int, error) {
+	port, err := findPort(3000)
+	if err != nil {
+		return 0, err
+	}
+
+	fmt.Printf("Creating container %s on port %d...\n", name, port)
+
 	renameCmd := fmt.Sprintf("mv /workspace/railsiran /workspace/%s && tail -f /dev/null", name)
 
 	cmd := exec.Command(
 		"docker", "run", "-d",
 		"--name", name,
+		"-p", fmt.Sprintf("%d:3000", port),
 		imageName+":latest",
 		"sh", "-c", renameCmd,
 	)
@@ -90,14 +109,14 @@ func createContainer(name, imageName string) error {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker run failed: %w", err)
+		return 0, fmt.Errorf("docker run failed: %w", err)
 	}
 
 	fmt.Println("Waiting for container to be ready...")
-	time.Sleep(3 * time.Second)
+	time.Sleep(4 * time.Second)
 
 	fmt.Println("Container created.")
-	return nil
+	return port, nil
 }
 
 // copyProject copies the project from the container to ~/ric/<name>.
@@ -205,10 +224,6 @@ func New(inputs []string, flagArgs []string) error {
 		return err
 	}
 
-	if err := ensureRicDir(); err != nil {
-		return err
-	}
-
 	fmt.Printf("Creating new project: %s\n", name)
 	if flags.css != "" {
 		fmt.Printf("  css: %s\n", flags.css)
@@ -219,7 +234,8 @@ func New(inputs []string, flagArgs []string) error {
 		return err
 	}
 
-	if err := createContainer(name, imageName); err != nil {
+	port, err := createContainer(name, imageName)
+	if err != nil {
 		return err
 	}
 
@@ -227,7 +243,7 @@ func New(inputs []string, flagArgs []string) error {
 		return err
 	}
 
-	fmt.Printf("Project %s is ready at ~/ric/%s\n", name, name)
+	fmt.Printf("Project %s is ready at ./%s (port %d)\n", name, name, port)
 	return nil
 }
 
