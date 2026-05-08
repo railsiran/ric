@@ -21,13 +21,43 @@ func Export(inputs []string, flagArgs []string) error {
 		return fmt.Errorf("container %s not found — are you inside a ric project directory?", name)
 	}
 
-	// 1. Precompile assets
+	// 1. Run production migrations
+	fmt.Println("Running production migrations...")
+	migrateCmd := exec.Command(
+		"docker", "exec",
+		"-w", "/workspace/"+name,
+		"-e", "RAILS_ENV=production",
+		name,
+		"bin/rails", "db:migrate",
+	)
+	migrateCmd.Stdout = os.Stdout
+	migrateCmd.Stderr = os.Stderr
+	if err := migrateCmd.Run(); err != nil {
+		return fmt.Errorf("migrate failed: %w", err)
+	}
+
+	// 2. Seed production database
+	fmt.Println("Seeding production database...")
+	seedCmd := exec.Command(
+		"docker", "exec",
+		"-w", "/workspace/"+name,
+		"-e", "RAILS_ENV=production",
+		name,
+		"bin/rails", "db:seed",
+	)
+	seedCmd.Stdout = os.Stdout
+	seedCmd.Stderr = os.Stderr
+	// db:seed might fail if seeds already ran — that's ok
+	_ = seedCmd.Run()
+
+	// 3. Precompile assets
 	fmt.Println("Precompiling assets for production...")
 	precompileCmd := exec.Command(
 		"docker", "exec",
 		"-w", "/workspace/"+name,
+		"-e", "RAILS_ENV=production",
 		name,
-		"bin/rails", "assets:precompile", "-e", "production",
+		"bin/rails", "assets:precompile",
 	)
 	precompileCmd.Stdout = os.Stdout
 	precompileCmd.Stderr = os.Stderr
@@ -35,7 +65,7 @@ func Export(inputs []string, flagArgs []string) error {
 		return fmt.Errorf("assets precompile failed: %w", err)
 	}
 
-	// 2. Stop the container
+	// 4. Stop the container
 	fmt.Println("Stopping container...")
 	stopCmd := exec.Command("docker", "stop", name)
 	stopCmd.Stdout = os.Stdout
@@ -44,7 +74,7 @@ func Export(inputs []string, flagArgs []string) error {
 		return fmt.Errorf("stop failed: %w", err)
 	}
 
-	// 3. Commit to a new image
+	// 5. Commit to a new image
 	fmt.Println("Committing container to image...")
 	commitCmd := exec.Command("docker", "commit", name, name+":latest")
 	commitCmd.Stdout = os.Stdout
@@ -53,7 +83,7 @@ func Export(inputs []string, flagArgs []string) error {
 		return fmt.Errorf("commit failed: %w", err)
 	}
 
-	// 4. Save to .tar
+	// 6. Save to .tar
 	tarFile := name + ".tar"
 	fmt.Printf("Exporting image to %s...\n", tarFile)
 	saveCmd := exec.Command("docker", "save", "-o", tarFile, name+":latest")
@@ -65,8 +95,4 @@ func Export(inputs []string, flagArgs []string) error {
 
 	fmt.Printf("Export complete: %s\n", tarFile)
 	return nil
-}
-
-func init() {
-	dispatcher.Register("export", Export)
 }
