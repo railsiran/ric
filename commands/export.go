@@ -96,3 +96,7 @@ func Export(inputs []string, flagArgs []string) error {
 	fmt.Printf("Export complete: %s\n", tarFile)
 	return nil
 }
+
+func init() {
+	dispatcher.Register("export", Export)
+}
