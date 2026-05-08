@@ -1,16 +1,17 @@
+// commands/version.go
 package commands
 
 import (
-    "fmt"
-    "ric/dispatcher"
+	"fmt"
+	"ric/dispatcher"
+	"ric/version"
 )
 
-// Version prints the CLI version.
 func Version(inputs []string, flagArgs []string) error {
-    fmt.Println("ri v0.1.0")
-    return nil
+	fmt.Println(version.Info())
+	return nil
 }
 
 func init() {
-    dispatcher.Register("version", Version)
+	dispatcher.Register("version", Version)
 }
