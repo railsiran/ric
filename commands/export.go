@@ -21,6 +21,12 @@ func Export(inputs []string, flagArgs []string) error {
 		return fmt.Errorf("container %s not found — are you inside a ric project directory?", name)
 	}
 
+	// Determine output directory (default: parent directory)
+	outputDir := filepath.Dir(cwd)
+	if len(inputs) > 0 {
+		outputDir = inputs[0]
+	}
+
 	// 1. Run production migrations
 	fmt.Println("Running production migrations...")
 	migrateCmd := exec.Command(
@@ -84,7 +90,11 @@ func Export(inputs []string, flagArgs []string) error {
 	}
 
 	// 6. Save to .tar
-	tarFile := name + ".tar"
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("cannot create output directory: %w", err)
+	}
+	tarFile := filepath.Join(outputDir, name+".tar")
+
 	fmt.Printf("Exporting image to %s...\n", tarFile)
 	saveCmd := exec.Command("docker", "save", "-o", tarFile, name+":latest")
 	saveCmd.Stdout = os.Stdout
