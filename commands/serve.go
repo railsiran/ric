@@ -1,4 +1,3 @@
-// commands/serve.go
 package commands
 
 import (
