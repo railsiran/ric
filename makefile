@@ -3,7 +3,7 @@ BUILD_DIR := dist
 
 # Default values (used when no arguments given)
 VERSION ?= 0.0.0-dev
-CODENAME ?= mystery-kebab
+CODENAME ?= ric-sanchez
 
 # Build metadata
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
