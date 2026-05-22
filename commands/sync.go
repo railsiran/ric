@@ -1,3 +1,4 @@
+// commands/sync.go
 package commands
 
 import (
@@ -8,9 +9,9 @@ import (
 	"ric/dispatcher"
 )
 
-// Sync copies host project files to the container.
-// It mirrors app/, db/, and config/ exactly, so deleted files are removed.
-// storage/ is never touched – your databases and uploads stay safe.
+// Sync mirrors your host project into the container.
+// Everything is synced except the `tmp` and `storage` directories.
+// Deleted files on the host are also removed from the container.
 func Sync(inputs []string, flagArgs []string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -23,32 +24,38 @@ func Sync(inputs []string, flagArgs []string) error {
 		return fmt.Errorf("container %s not found — are you inside a ric project directory?", name)
 	}
 
-	// Directories to mirror from host → container
-	dirs := []string{"app", "db", "config"}
+	// List top-level entries in the host project
+	entries, err := os.ReadDir(cwd)
+	if err != nil {
+		return fmt.Errorf("cannot read project directory: %w", err)
+	}
 
-	for _, dir := range dirs {
-		hostDir := filepath.Join(cwd, dir)
-		if _, err := os.Stat(hostDir); os.IsNotExist(err) {
-			// Skip if the host doesn't have this directory yet
+	for _, entry := range entries {
+		entryName := entry.Name()
+
+		// Never touch tmp/ or storage/ – those contain databases and uploads
+		if entryName == "tmp" || entryName == "storage" {
 			continue
 		}
 
-		// Remove the existing directory inside the container
-		containerPath := fmt.Sprintf("/workspace/%s/%s", name, dir)
-		rmCmd := exec.Command("docker", "exec", name, "rm", "-rf", containerPath)
-		rmCmd.Run() // ignore error if it doesn't exist
+		hostPath := filepath.Join(cwd, entryName)
+		containerPath := fmt.Sprintf("/workspace/%s/%s", name, entryName)
 
-		// Copy host directory into the container (creates the directory)
-		fmt.Printf("Syncing %s/...\n", dir)
-		cpCmd := exec.Command("docker", "cp", "-a", hostDir, fmt.Sprintf("%s:/workspace/%s/", name, name))
-		cpCmd.Stdout = os.Stdout
+		// Remove the old version inside the container (if it exists)
+		rmCmd := exec.Command("docker", "exec", name, "rm", "-rf", containerPath)
+		rmCmd.Run() // ignore error if path doesn't exist
+
+		// Copy the current version from host to container
+		fmt.Printf("Syncing %s/...\n", entryName)
+		cpCmd := exec.Command("docker", "cp", "-a", hostPath, fmt.Sprintf("%s:/workspace/%s/", name, name))
+		cpCmd.Stdout = nil
 		cpCmd.Stderr = os.Stderr
 		if err := cpCmd.Run(); err != nil {
-			return fmt.Errorf("sync %s failed: %w", dir, err)
+			return fmt.Errorf("sync %s failed: %w", entryName, err)
 		}
 	}
 
-	fmt.Println("Sync complete – app/, db/, config/ mirrored. storage/ untouched.")
+	fmt.Println("Sync complete – tmp/ and storage/ left untouched.")
 	return nil
 }
 
