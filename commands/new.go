@@ -3,19 +3,20 @@ package commands
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
-	"net"
 
 	"ric/dispatcher"
 )
 
-const baseURL = "http://localhost:3000"
+// BaseURL is the server base URL for downloading Docker images.
+// It is set at build time via ldflags.
+var BaseURL = "http://localhost:3000"
 
-// downloadImage pulls the .tar file from the server.
 // loadImage downloads and loads a Docker image, or checks local if --local.
 func loadImage(css string, local bool) (string, error) {
 	imageName := "ri_base"
@@ -34,7 +35,7 @@ func loadImage(css string, local bool) (string, error) {
 	}
 
 	// Download
-	url := fmt.Sprintf("%s/package?name=%s", baseURL, imageName)
+	url := fmt.Sprintf("%s/package?name=%s", BaseURL, imageName)
 	tarPath := filepath.Join(os.TempDir(), imageName+".tar")
 
 	fmt.Printf("Downloading %s...\n", imageName)
@@ -101,7 +102,6 @@ func createContainer(name, imageName string) (int, error) {
 		name,
 	)
 
-
 	cmd := exec.Command(
 		"docker", "run", "-d",
 		"--name", name,
@@ -123,9 +123,8 @@ func createContainer(name, imageName string) (int, error) {
 	return port, nil
 }
 
-// copyProject copies the project from the container to ~/ric/<name>.
+// copyProject copies the project from the container to the current directory.
 func copyProject(name string) error {
-
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("cannot get current directory: %w", err)
@@ -139,7 +138,6 @@ func copyProject(name string) error {
 	}
 
 	fmt.Printf("Copying project to %s...\n", targetDir)
-
 
 	source := fmt.Sprintf("%s:/workspace/%s", name, name)
 	cmd := exec.Command("docker", "cp", "-a", source, targetDir)
@@ -204,19 +202,7 @@ func parseFlags(flagArgs []string) (newFlags, error) {
 	return flags, nil
 }
 
-// ensureRicDir creates ~/ric if it doesn't exist.
-func ensureRicDir() error {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("cannot find home directory: %w", err)
-	}
-	ricDir := filepath.Join(homeDir, "ric")
-	if err := os.MkdirAll(ricDir, 0755); err != nil {
-		return fmt.Errorf("cannot create ~/ric: %w", err)
-	}
-	return nil
-}
-
+// New creates a new project from a Docker image.
 func New(inputs []string, flagArgs []string) error {
 	name, err := parseName(inputs)
 	if err != nil {
