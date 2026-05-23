@@ -1,3 +1,4 @@
+// commands/new.go
 package commands
 
 import (
@@ -152,6 +153,40 @@ func copyProject(name string) error {
 	return nil
 }
 
+// regenerateMasterKey creates a new master.key and credentials.yml.enc
+// inside the container and copies them back to the host project.
+func regenerateMasterKey(name string) error {
+	// Remove old files and generate new ones inside the container
+	genCmd := exec.Command("docker", "exec",
+		"-w", "/workspace/"+name,
+		name,
+		"sh", "-c",
+		"rm -f config/master.key config/credentials.yml.enc && EDITOR=true bin/rails credentials:edit",
+	)
+	genCmd.Stdout = os.Stdout
+	genCmd.Stderr = os.Stderr
+	if err := genCmd.Run(); err != nil {
+		return fmt.Errorf("regenerate master key: %w", err)
+	}
+
+	// Copy the new files back to the host project
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get current directory: %w", err)
+	}
+	for _, file := range []string{"config/master.key", "config/credentials.yml.enc"} {
+		src := fmt.Sprintf("%s:/workspace/%s/%s", name, name, file)
+		dst := filepath.Join(cwd, name, file)
+		cpCmd := exec.Command("docker", "cp", src, dst)
+		cpCmd.Stdout = os.Stdout
+		cpCmd.Stderr = os.Stderr
+		if err := cpCmd.Run(); err != nil {
+			return fmt.Errorf("copy %s back: %w", file, err)
+		}
+	}
+	return nil
+}
+
 // parseName extracts and validates the project name from inputs.
 func parseName(inputs []string) (string, error) {
 	if len(inputs) != 1 {
@@ -230,6 +265,11 @@ func New(inputs []string, flagArgs []string) error {
 	}
 
 	if err := copyProject(name); err != nil {
+		return err
+	}
+
+	// Generate a unique master key for this project
+	if err := regenerateMasterKey(name); err != nil {
 		return err
 	}
 
