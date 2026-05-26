@@ -105,6 +105,22 @@ func mcpTools() []mcpTool {
 				"properties": map[string]any{},
 			},
 		},
+		{
+			Name:        "ric_deploy",
+			Description: "Deploy the application to a remote server (first-time setup). Requires .ric/deploy.yml to be configured.",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "ric_upgrade",
+			Description: "Upgrade an existing deployment on the remote server (preserves database and credentials). Requires .ric/deploy.yml to be configured.",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
 	}
 }
 
@@ -206,6 +222,18 @@ func callMCPTool(name string, args json.RawMessage) (string, error) {
 			return "", err
 		}
 		return "Migrations complete", nil
+
+	case "ric_deploy":
+		if err := Deploy(nil, nil); err != nil {
+			return "", err
+		}
+		return "Deploy complete", nil
+
+	case "ric_upgrade":
+		if err := Upgrade(nil, nil); err != nil {
+			return "", err
+		}
+		return "Upgrade complete", nil
 
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
