@@ -41,55 +41,74 @@ registry_mirror: dockerhub.example.com   # اگر VPS شما نمی‌تواند
 
 ### مرجع فیلدها
 
-| فیلد | اجباری | معنی |
-|-------|----------|---------|
-| `host` | بله | IP یا hostname سرور |
-| `user` | بله | کاربر SSH — باید root باشد یا sudo بدون رمز داشته باشد (ric در صورت نیاز یک‌بار خودش راه می‌اندازد) |
-| `ssh_key` | خیر | مسیر کلید خصوصی SSH. حذف کنید تا با رمز عبور وارد شوید — یک‌بار از شما پرسیده می‌شود |
-| `port` | خیر | پورت SSH (پیش‌فرض 22) |
-| `domain` | بله | دامنه‌ای که اپلیکیشن از طریق آن سرو می‌شود؛ به `server_name` در nginx می‌رود |
-| `ssl_dir` | بله | پوشه‌ی **محلی** شامل گواهی به صورت `fullchain.pem` + `privkey.pem` |
-| `registry_mirror` | خیر | آینه‌ی pull-through مربوط به Docker Hub که توسط daemon استفاده می‌شود (وقتی Docker Hub فیلتر یا کند است مفید است) |
+فیلد `host` اجباری است. این IP یا hostname سرور شماست.
 
-`~` در `ssh_key` و `ssl_dir` گسترش داده می‌شود.
+فیلد `user` اجباری است. این کاربر SSH است که ric با آن وارد می‌شود. کاربر باید root باشد یا sudo بدون رمز داشته باشد. اگر هیچ‌کدام نباشد، ric در اولین deploy پیشنهاد می‌دهد sudo بدون رمز را با نوشتن یک فایل `/etc/sudoers.d/ric-<user>` راه‌اندازی کند — یک‌بار رمز sudo را می‌پرسد، و deployهای بعدی بدون مداخله انجام می‌شوند.
+
+فیلد `ssh_key` اختیاری است. این مسیر کلید خصوصی SSH است که ric باید استفاده کند. شورت‌کات `~` برای پوشه‌ی خانگی پشتیبانی می‌شود. اگر این فیلد را حذف کنید، ric به authentication با رمز عبور برمی‌گردد و یک‌بار از شما پرسیده می‌شود.
+
+فیلد `port` اختیاری است. این پورت SSH است؛ پیش‌فرض `22` است. اگر سرور شما از پورت غیراستاندارد استفاده می‌کند، صریحا تنظیم کنید.
+
+فیلد `domain` اجباری است. این دامنه‌ی عمومی است که اپلیکیشن شما از طریق آن سرو می‌شود، و به دستور `server_name` در پیکربندی nginx تولیدشده می‌رود.
+
+فیلد `ssl_dir` اجباری است. این یک پوشه‌ی **محلی** روی سیستم دولوپر شماست که گواهی شما را به صورت `fullchain.pem` و کلید خصوصی شما را به صورت `privkey.pem` نگه می‌دارد. شورت‌کات `~` پشتیبانی می‌شود. هر دو فایل باید موجود باشند؛ ric در صورت نبود هر یک، از شروع deploy خودداری می‌کند.
+
+فیلد `registry_mirror` اختیاری است. این host یک آینه‌ی pull-through مربوط به Docker Hub است که daemon داکر سرور باید استفاده کند. این وقتی مفید است که VPS شما نمی‌تواند مستقیما به Docker Hub وصل شود — مثلا در کشوری که Docker Hub فیلتر یا کند است. ric این را در `/etc/docker/daemon.json` روی سرور می‌نویسد و قبل از تکیه به آن، کارکردش را تایید می‌کند.
 
 ## کاری که `ric deploy` انجام می‌دهد
 
-۱. **اعتبارسنجی محلی** — `.ric/deploy.yml` را می‌خواند، وجود فایل‌های SSL را بررسی می‌کند، و در حال اجرا بودن کانتینر دولوپمنت را تایید می‌کند.
-۲. **ساخت ایمیج** — `RAILS_ENV=production bin/rails assets:precompile`، سپس `docker commit` و `docker save` به یک `.tar` با آدرس‌دهی محتوایی (`<sha256>.tar`). ایمیج موقت محلی پاک می‌شود.
-۳. **باز کردن اتصال master SSH** — multiplex می‌شود تا فقط یک‌بار (در صورت وجود) رمز عبور وارد کنید.
-۴. **تشخیص دسترسی روی ریموت** — اگر کاربر SSH شما root نیست و sudo بدون رمز ندارد، ric یک‌بار رمز sudo را می‌پرسد و `/etc/sudoers.d/ric-<user>` را می‌نویسد تا deployهای بعدی بدون مداخله انجام شوند.
-۵. **نصب داکر** روی سرور در صورت عدم وجود.
-۶. **پیکربندی آینه‌ی رجیستری** در `/etc/docker/daemon.json` و اعتبارسنجی آن با pull کردن `hello-world`.
-۷. **آماده‌سازی layout** در `/var/lib/ric/<project>/` (credentials، storage، images) و `/var/lib/ric/_shared/` مشترک (sites-enabled، ssl، ric-nginx).
-۸. **آپلود فایل tar ایمیج**، گواهی‌های SSL، و یک site config تولیدشده‌ی nginx.
-۹. **تولید credentialهای Rails production** روی سرور (`config/credentials/production.key` + `production.yml.enc`) و نگه‌داشتن دائمی آن‌ها؛ master key را به `.ric/keys/production.key` محلی (mode 0600) برمی‌گرداند تا بعدا قابل بازیابی باشد.
-۱۰. **اجرای `db:prepare`** (دیتابیس‌های Solid Trifecta را زیر mount دائمی `storage/` می‌سازد، migrate می‌کند و seed می‌زند).
-۱۱. **شروع کانتینر اپلیکیشن** با `bin/rails server -b 0.0.0.0 -p 3000` و `SOLID_QUEUE_IN_PUMA=true` (worker صف داخل پروسه‌ی web اجرا می‌شود).
-۱۲. **شروع `ric-nginx` مشترک** اگر در حال اجرا نیست، bind به 80/443، و سپس reload کردن آن برای دریافت site config شما.
-۱۳. **نوشتن `current_sha`** به عنوان نشانگر موفقیت.
+اول، ric **اعتبارسنجی محلی** می‌کند — `.ric/deploy.yml` را می‌خواند، وجود فایل‌های SSL را بررسی می‌کند، و در حال اجرا بودن کانتینر دولوپمنت را تایید می‌کند.
 
-سطر پایانی: `Deployed <name> @ <short_sha> to <host>. Live at https://<domain>`.
+دوم، **ایمیج production را می‌سازد**: `RAILS_ENV=production bin/rails assets:precompile` را داخل کانتینر اجرا می‌کند، سپس `docker commit` و `docker save` می‌زند تا یک فایل `.tar` با آدرس‌دهی محتوایی بسازد که نام آن sha256 محتوا است. ایمیج موقت محلی پس از نوشتن tar پاک می‌شود.
+
+سوم، **یک اتصال master SSH باز می‌کند** که multiplex شده تا فقط یک‌بار (در صورت وجود) رمز عبور را برای کل deploy وارد کنید. تماس‌های ssh و scp بعدی از همان socket بدون پرسیدن مجدد استفاده می‌کنند.
+
+چهارم، **دسترسی شما روی ریموت را تشخیص می‌دهد**. اگر کاربر SSH شما root است، هیچ تنظیم اضافه‌ای لازم نیست. اگر کاربر شما sudo بدون رمز دارد، ric فقط دستورها را با sudo prefix می‌کند. در غیر این صورت، ric یک‌بار یک دستور sudo تعاملی اجرا می‌کند (یک‌بار رمز sudo را می‌پرسد) تا `/etc/sudoers.d/ric-<user>` را بنویسد، و سپس بقیه‌ی deploy را بدون مداخله ادامه می‌دهد.
+
+پنجم، **داکر را نصب می‌کند** روی سرور اگر `docker` پیدا نشود. نصب از اسکریپت رسمی `get.docker.com` استفاده می‌کند.
+
+ششم، **آینه‌ی رجیستری را پیکربندی می‌کند** با نوشتن `/etc/docker/daemon.json` با مقدار `registry_mirror` شما و restart کردن daemon داکر — اما فقط در صورتی که فایل واقعا نیاز به تغییر داشته باشد. بعد از نوشتن، با pull کردن `hello-world` کارکرد آینه را تایید می‌کند.
+
+هفتم، **layout پوشه‌ها را روی سرور آماده می‌کند**. پوشه‌ی هر پروژه `/var/lib/ric/<project>/` است و شامل زیرپوشه‌هایی برای credentials، storage دائمی و artifactهای ایمیج است. پوشه‌ی مشترک بین پروژه‌ها `/var/lib/ric/_shared/` است و شامل درخت sites-enabled مربوط به nginx مشترک، درخت‌های SSL هر پروژه و میزبان کانتینر تک‌نسخه‌ای `ric-nginx` است.
+
+هشتم، **آپلود می‌کند** فایل tar ایمیج را (در صورتی که tar با همان sha256 از قبل روی سرور باشد، رد می‌شود)، گواهی‌های SSL را، و یک site config تازه‌تولیدشده‌ی nginx را.
+
+نهم، **credentialهای Rails production تولید می‌کند** روی سرور. ric یک کانتینر دور انداختنی می‌سازد، `bin/rails credentials:edit --environment production` را با `EDITOR=true` اجرا می‌کند تا ادیتور بلافاصله خارج شود، `production.key` و `production.yml.enc` تولیدشده را به یک مکان دائمی کپی می‌کند، و کانتینر دور انداختنی را پاک می‌کند. master key سپس به سیستم محلی شما برگردانده شده و در `.ric/keys/production.key` با mode `0600` ذخیره می‌شود، تا بعدا قابل بازیابی باشد.
+
+دهم، **`db:prepare` را اجرا می‌کند** در یک کانتینر یک‌باره با volume مربوط به storage دائمی mount شده. این دیتابیس‌های Solid Trifecta (primary، queue، cache، cable) را می‌سازد، migrate می‌کند و seed می‌زند.
+
+یازدهم، **کانتینر اپلیکیشن را شروع می‌کند** که `bin/rails server -b 0.0.0.0 -p 3000` را با متغیر محیطی `SOLID_QUEUE_IN_PUMA=true` اجرا می‌کند. این یعنی dispatcher و worker مربوط به solid_queue در همان پروسه‌ی Puma که web را اجرا می‌کند، اجرا می‌شوند — نه daemon worker جداگانه، نه foreman، نه Procfile.
+
+دوازدهم، **`ric-nginx` مشترک را شروع می‌کند** اگر در حال اجرا نباشد، به پورت‌های 80 و 443 میزبان bind می‌کند، و سپس reload می‌کند تا site config شما را بردارد. اگر `ric-nginx` از قبل در حال اجرا بود (از deploy یک پروژه‌ی قبلی روی این سرور)، restart نمی‌شود — فقط reload می‌شود.
+
+سیزدهم و آخر، **`current_sha` را می‌نویسد** به عنوان نشانگر موفقیت. وجود این فایل همان چیزی است که به اجراهای بعدی `ric upgrade` می‌گوید این پروژه deploy شده است.
+
+سطر چاپ‌شده‌ی پایانی `Deployed <name> @ <short_sha> to <host>. Live at https://<domain>` است.
 
 ## بعد از deploy
 
-- `.ric/keys/production.key` روی سیستم شما وجود دارد — **`.ric/keys/` را به `.gitignore` خود اضافه کنید**.
-- layout ریموت زیر `/var/lib/ric/<name>/` و `/var/lib/ric/_shared/` همان چیزی است که اجراهای بعدی `ric upgrade` روی آن بنا می‌کنند.
-- REPL production می‌خواهید؟ `ric console --remote` ([`ric console`](04-console.md) را ببینید).
-- نسخه‌ی جدید می‌خواهید بفرستید؟ [`ric upgrade`](07-upgrade.md).
+یک فایل جدید در `.ric/keys/production.key` روی سیستم محلی شما می‌بینید. **`.ric/keys/` را به `.gitignore` خود اضافه کنید** تا master key از version control بیرون بماند.
+
+layout ریموت زیر `/var/lib/ric/<name>/` و `/var/lib/ric/_shared/` همان چیزی است که اجراهای بعدی `ric upgrade` روی آن بنا می‌کنند.
+
+برای باز کردن REPL production، `ric console --remote` را اجرا کنید — [`ric console`](04-console.md) را ببینید.
+
+برای فرستادن نسخه‌ی جدید اپلیکیشن، [`ric upgrade`](07-upgrade.md) را اجرا کنید.
 
 ## چند پروژه روی یک سرور
 
-`ric deploy` دقیقا برای این طراحی شده است. اولین پروژه‌ای که deploy می‌شود یک `ric-nginx` تک‌نسخه‌ای راه می‌اندازد و به 80/443 bind می‌کند؛ پروژه‌های بعدی فقط یک site config زیر `/var/lib/ric/_shared/nginx/sites-enabled/<name>.conf` می‌گذارند و `nginx -s reload` آن را برمی‌دارد. مسیریابی بر اساس `server_name` انجام می‌شود (همان `domain` که برای هر پروژه پیکربندی کرده‌اید).
+`ric deploy` دقیقا برای این طراحی شده است. اولین پروژه‌ای که deploy می‌شود یک کانتینر `ric-nginx` تک‌نسخه‌ای را شروع می‌کند و به پورت‌های 80 و 443 میزبان bind می‌کند. پروژه‌های بعدی nginx خودشان را شروع نمی‌کنند؛ آن‌ها فقط یک site config زیر `/var/lib/ric/_shared/nginx/sites-enabled/<name>.conf` می‌گذارند و `nginx -s reload` آن را برمی‌دارد. مسیریابی بین پروژه‌ها بر اساس `server_name` انجام می‌شود، یعنی همان `domain` که برای هر پروژه پیکربندی کرده‌اید.
 
 ## اجرای مجدد deploy
 
-اگر `ric deploy` را اجرا کنید و deploy قبلی کامل شده باشد (نشانگر `current_sha` وجود داشته باشد)، رد می‌کند و شما را به `ric upgrade` ارجاع می‌دهد. این عمدی است — `deploy` آماده‌سازی است؛ `upgrade` انتشار.
+اگر `ric deploy` را اجرا کنید و deploy قبلی کامل شده باشد (نشانگر `current_sha` وجود داشته باشد)، ric رد می‌کند و شما را به `ric upgrade` ارجاع می‌دهد. این رد عمدی است — `deploy` آماده‌سازی است، `upgrade` انتشار.
 
-اگر `ric deploy` قبلی *در میانه راه crash کرده باشد*، حالت ناقص خودکار در اجرای بعدی تشخیص داده و پاک می‌شود.
+اگر `ric deploy` قبلی *در میانه راه crash کرده باشد*، حالت ناقص در اجرای بعدی تشخیص داده و خودکار قبل از تلاش مجدد پاک می‌شود.
 
 ## رفع اشکال
 
-- **«the registry mirror is not serving …»** — مقدار mirror در `.ric/deploy.yml` شما اشتباه است (معمولا scheme ای مثل `https://` یا یک مسیر در آن گنجانده شده). `/etc/docker/daemon.json` روی سرور را بررسی کنید.
-- **کانتینر اپلیکیشن در حلقه‌ی restart** — `ssh user@host docker logs <name>`. علل رایج: gem از قلم افتاده، خطای migration، مشکل master key.
-- **nginx در حلقه‌ی restart** — `ssh user@host docker logs ric-nginx`. معمولا مسیر/فرمت گواهی SSL یا یک typo در site config تولیدشده.
+اگر پیام «the registry mirror is not serving …» را می‌بینید، مقدار mirror در `.ric/deploy.yml` شما اشتباه است. اغلب این یک scheme مثل `https://` یا یک مسیر است که در جایی گنجانده شده که ric فقط hostname را می‌خواهد. ric تلاش می‌کند فرمت‌های رایج را اصلاح کند، اما اگر مشکل ادامه داشت، `/etc/docker/daemon.json` روی سرور را بررسی کنید.
+
+اگر کانتینر اپلیکیشن در حلقه‌ی restart است، `ssh user@host docker logs <name>` را اجرا کنید. علل رایج عبارتند از gem از قلم افتاده، خطای migration در اولین boot، یا مشکل decrypt master key.
+
+اگر nginx در حلقه‌ی restart است، `ssh user@host docker logs ric-nginx` را اجرا کنید. رایج‌ترین علل مشکل مسیر یا فرمت گواهی SSL، یا خطای syntax در site config تولیدشده است.
