@@ -98,14 +98,17 @@ func Deploy(inputs []string, flagArgs []string) error {
 		sess.configureDockerMirror,
 		sess.verifyRegistryMirror,
 		sess.ensureFirstDeploy,
+		sess.provisionSharedLayout,
 		sess.provisionLayout,
 		func() error { return sess.uploadArtifacts(tarPath, sha) },
 		func() error { return sess.loadAndTagImage(sha) },
 		sess.ensureNetwork,
 		func() error { return sess.generateProdCredentials(sha) },
+		sess.syncMasterKeyLocal,
 		func() error { return sess.runDBPrepare(sha) },
 		func() error { return sess.startApp(sha) },
-		sess.startNginx,
+		sess.ensureSharedNginx,
+		sess.reloadNginx,
 		func() error { return sess.writeCurrentSHA(sha) },
 	} {
 		if err := step(); err != nil {
@@ -521,8 +524,12 @@ func (s *deploySession) ensureFirstDeploy() error {
 	if _, ok := s.sshQuiet("test -d " + shellQuote(root) + " && echo yes"); ok {
 		fmt.Printf("  Found partial state from a previous failed deploy at %s — cleaning up.\n", root)
 		cleanup := fmt.Sprintf(
-			"rm -rf %s; docker rm -f %s %s-nginx >/dev/null 2>&1; true",
-			shellQuote(root), s.name, s.name)
+			"rm -rf %s %s/ssl/%s %s/nginx/sites-enabled/%s.conf; "+
+				"docker rm -f %s >/dev/null 2>&1; true",
+			shellQuote(root),
+			shellQuote(sharedRoot), s.name,
+			shellQuote(sharedRoot), s.name,
+			s.name)
 		if err := s.ssh("clean up partial deploy", s.priv(cleanup)); err != nil {
 			return fmt.Errorf("could not clean up partial state at %s — remove it manually and retry: %w", root, err)
 		}
@@ -530,11 +537,34 @@ func (s *deploySession) ensureFirstDeploy() error {
 	return nil
 }
 
+// sharedRoot is where the cross-project nginx, ssl, and sites-enabled live.
+// One ric-nginx container fronts every project's app container by hostname.
+const sharedRoot = "/var/lib/ric/_shared"
+
+// provisionSharedLayout creates the host-wide directories used by every
+// project: shared nginx sites-enabled and per-project SSL trees. Idempotent;
+// runs on every deploy and upgrade.
+func (s *deploySession) provisionSharedLayout() error {
+	dirs := []string{
+		sharedRoot,
+		sharedRoot + "/nginx/sites-enabled",
+		sharedRoot + "/ssl",
+		sharedRoot + "/ssl/" + s.name,
+	}
+	quoted := make([]string, len(dirs))
+	for i, d := range dirs {
+		quoted[i] = shellQuote(d)
+	}
+	cmd := fmt.Sprintf("mkdir -p %s && chown -R %s %s",
+		strings.Join(quoted, " "), s.cfg.User, shellQuote(sharedRoot))
+	return s.ssh("provisioning "+sharedRoot, s.priv(cmd))
+}
+
 func (s *deploySession) provisionLayout() error {
 	// Enumerate subdirs explicitly. Brace expansion is bash-only — would silently
 	// become a literal directory name under dash (/bin/sh on Debian/Ubuntu) and
 	// break the later scp into images/.
-	subs := []string{"credentials", "storage", "ssl", "nginx", "images"}
+	subs := []string{"credentials", "storage", "images"}
 	paths := make([]string, len(subs))
 	for i, sub := range subs {
 		paths[i] = shellQuote(s.root() + "/" + sub)
@@ -563,22 +593,24 @@ func (s *deploySession) uploadArtifacts(tarPath, sha string) error {
 
 	step("Uploading SSL certificates")
 	for _, f := range []string{"fullchain.pem", "privkey.pem"} {
-		if err := s.scp("upload "+f, filepath.Join(s.cfg.SSLDir, f), root+"/ssl/"+f); err != nil {
+		dst := sharedRoot + "/ssl/" + s.name + "/" + f
+		if err := s.scp("upload "+f, filepath.Join(s.cfg.SSLDir, f), dst); err != nil {
 			return err
 		}
 	}
-	done("SSL certificates uploaded")
+	done("SSL certificates uploaded to " + sharedRoot + "/ssl/" + s.name)
 
-	step("Uploading generated nginx config")
+	step("Uploading generated nginx site config")
 	confLocal := filepath.Join(os.TempDir(), s.name+"-nginx.conf")
 	if err := os.WriteFile(confLocal, []byte(renderNginxConf(s.name, s.cfg.Domain)), 0644); err != nil {
 		return fmt.Errorf("write nginx config to %s: %w", confLocal, err)
 	}
 	defer os.Remove(confLocal)
-	if err := s.scp("upload nginx.conf", confLocal, root+"/nginx/default.conf"); err != nil {
+	dst := sharedRoot + "/nginx/sites-enabled/" + s.name + ".conf"
+	if err := s.scp("upload site config", confLocal, dst); err != nil {
 		return err
 	}
-	done("Nginx config uploaded")
+	done("Nginx site config uploaded")
 	return nil
 }
 
@@ -646,6 +678,31 @@ func (s *deploySession) generateProdCredentials(sha string) error {
 	return nil
 }
 
+// syncMasterKeyLocal saves the production master key generated on the remote
+// into ./.ric/keys/production.key (mode 0600) on the developer's machine, so
+// it can be recovered after a disk wipe / new clone. The file on the server is
+// root-owned (docker wrote it), so we sudo-cat it through ssh rather than
+// scping. Idempotent — the same content gets overwritten on subsequent runs.
+func (s *deploySession) syncMasterKeyLocal() error {
+	step("Saving production master key locally")
+	keyPath := s.root() + "/credentials/production.key"
+	out, ok := s.sshQuiet(s.priv("cat " + shellQuote(keyPath)))
+	if !ok || out == "" {
+		return fmt.Errorf("could not read %s on %s — key generation may have failed", keyPath, s.cfg.Host)
+	}
+
+	const localDir = ".ric/keys"
+	if err := os.MkdirAll(localDir, 0700); err != nil {
+		return fmt.Errorf("create %s: %w", localDir, err)
+	}
+	localPath := filepath.Join(localDir, "production.key")
+	if err := os.WriteFile(localPath, []byte(out+"\n"), 0600); err != nil {
+		return fmt.Errorf("write %s: %w", localPath, err)
+	}
+	done(localPath + " (mode 0600) — add .ric/keys/ to .gitignore")
+	return nil
+}
+
 func (s *deploySession) runDBPrepare(sha string) error {
 	step("Running db:prepare (migrations + seeds for fresh DBs)")
 	cmd := fmt.Sprintf("docker run --rm --network ric-net %s %s:%s bin/rails db:prepare",
@@ -674,28 +731,50 @@ func (s *deploySession) startApp(sha string) error {
 	return nil
 }
 
-func (s *deploySession) startNginx() error {
+// ensureSharedNginx starts the singleton ric-nginx container if it isn't
+// already running. The container binds the host's 80/443 and mounts the
+// shared sites-enabled + ssl trees, so adding a new project is just a matter
+// of dropping a site config file and reloading.
+func (s *deploySession) ensureSharedNginx() error {
+	if out, ok := s.sshQuiet("docker inspect -f '{{.State.Running}}' ric-nginx 2>/dev/null"); ok && out == "true" {
+		return nil
+	}
+
 	step("Pulling nginx image on remote")
 	if err := s.ssh("docker pull nginx:stable", s.priv("docker pull nginx:stable")); err != nil {
 		return err
 	}
 	done("Nginx image ready")
 
-	step("Starting nginx container")
-	containerName := s.name + "-nginx"
+	step("Starting shared ric-nginx container")
 	cmd := fmt.Sprintf(
-		"docker rm -f %[1]s >/dev/null 2>&1; true && "+
-			"docker run -d --name %[1]s --network ric-net --restart unless-stopped "+
+		"docker rm -f ric-nginx >/dev/null 2>&1; true && "+
+			"docker run -d --name ric-nginx --network ric-net --restart unless-stopped "+
 			"-p 80:80 -p 443:443 "+
-			"-v %[2]s/ssl:/etc/nginx/ssl:ro "+
-			"-v %[2]s/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro "+
+			"-v %[1]s/ssl:/etc/nginx/ssl:ro "+
+			"-v %[1]s/nginx/sites-enabled:/etc/nginx/conf.d:ro "+
 			"nginx:stable",
-		containerName, s.root())
-	if err := s.ssh("start nginx container", s.priv(cmd)); err != nil {
-		return fmt.Errorf("nginx container failed to start on %s — ports 80/443 may be in use (run 'ss -tlnp | grep -E \":80|:443\"' on the server to check): %w",
+		sharedRoot)
+	if err := s.ssh("start ric-nginx", s.priv(cmd)); err != nil {
+		return fmt.Errorf("ric-nginx failed to start on %s — ports 80/443 may already be in use (run 'ss -tlnp | grep -E \":80|:443\"' on the server to check): %w",
 			s.cfg.Host, err)
 	}
-	done("Nginx container started")
+	done("Shared ric-nginx running")
+	return nil
+}
+
+// reloadNginx asks the running ric-nginx to re-read its config. Uses
+// nginx -s reload rather than restarting the container so other projects'
+// active connections aren't disrupted. If reload fails, nginx keeps the
+// previous (working) config — safer than a container restart.
+func (s *deploySession) reloadNginx() error {
+	step("Reloading nginx configuration")
+	cmd := "docker exec ric-nginx nginx -t && docker exec ric-nginx nginx -s reload"
+	if err := s.ssh("nginx reload", s.priv(cmd)); err != nil {
+		return fmt.Errorf("nginx -t / reload failed on %s — site config at %s/nginx/sites-enabled/%s.conf may have a syntax error: %w",
+			s.cfg.Host, sharedRoot, s.name, err)
+	}
+	done("Nginx reloaded")
 	return nil
 }
 
@@ -718,8 +797,8 @@ server {
     http2 on;
     server_name %[2]s;
 
-    ssl_certificate     /etc/nginx/ssl/fullchain.pem;
-    ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+    ssl_certificate     /etc/nginx/ssl/%[1]s/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/%[1]s/privkey.pem;
 
     client_max_body_size 50m;
 
