@@ -19,9 +19,18 @@ import (
 var BaseURL = "http://localhost:3000"
 
 // loadImage downloads and loads a Docker image, or checks local if --local.
-func loadImage(css string, local bool) (string, error) {
+// The variant is picked from the JS choice (three / p5 / react — each already
+// includes tailwind), falling back to tailwind, falling back to base.
+func loadImage(css, js string, local bool) (string, error) {
 	imageName := "ri_base"
-	if css == "tailwind" {
+	switch {
+	case js == "three":
+		imageName = "ri_three"
+	case js == "p5":
+		imageName = "ri_p5"
+	case js == "react":
+		imageName = "ri_react"
+	case css == "tailwind":
 		imageName = "ri_tailwind"
 	}
 
@@ -210,7 +219,8 @@ func parseName(inputs []string) (string, error) {
 
 // newFlags holds the parsed flag values for the new command.
 type newFlags struct {
-	css   string // empty or "tailwind"
+	css   string // "" or "tailwind"
+	js    string // "" or "three" / "p5" / "react"
 	local bool
 }
 
@@ -228,11 +238,27 @@ func parseFlags(flagArgs []string) (newFlags, error) {
 				return flags, fmt.Errorf("unsupported css: %s (only 'tailwind' is supported)", flagArgs[i])
 			}
 			flags.css = flagArgs[i]
+		case "--js":
+			i++
+			if i >= len(flagArgs) {
+				return flags, fmt.Errorf("--js requires a value (three, p5, or react)")
+			}
+			switch flagArgs[i] {
+			case "three", "p5", "react":
+				flags.js = flagArgs[i]
+			default:
+				return flags, fmt.Errorf("unsupported js: %s (expected three, p5, or react)", flagArgs[i])
+			}
 		case "--local":
 			flags.local = true
 		default:
 			return flags, fmt.Errorf("unknown flag: %s", flagArgs[i])
 		}
+	}
+	// A JS variant already bundles tailwind, so specifying both is redundant
+	// and almost always a misunderstanding — reject it with a clear hint.
+	if flags.js != "" && flags.css != "" {
+		return flags, fmt.Errorf("--js %s already includes tailwind; drop --css", flags.js)
 	}
 	return flags, nil
 }
@@ -253,8 +279,11 @@ func New(inputs []string, flagArgs []string) error {
 	if flags.css != "" {
 		fmt.Printf("  css: %s\n", flags.css)
 	}
+	if flags.js != "" {
+		fmt.Printf("  js:  %s\n", flags.js)
+	}
 
-	imageName, err := loadImage(flags.css, flags.local)
+	imageName, err := loadImage(flags.css, flags.js, flags.local)
 	if err != nil {
 		return err
 	}
