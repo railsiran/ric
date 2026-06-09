@@ -34,6 +34,9 @@ func Upgrade(inputs []string, flagArgs []string) error {
 	if err := validateLocalArtifacts(cfg); err != nil {
 		return err
 	}
+	if err := validateProductionDB(); err != nil {
+		return err
+	}
 	if err := exec.Command("docker", "inspect", name).Run(); err != nil {
 		return fmt.Errorf("container %s not found — are you inside a ric project directory?", name)
 	}
