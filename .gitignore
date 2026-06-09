@@ -5,3 +5,4 @@ dist/
 *.exe
 *.test
 *.out
+.claude
