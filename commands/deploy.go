@@ -22,6 +22,8 @@ type DeployConfig struct {
 	Domain         string
 	SSLDir         string
 	RegistryMirror string
+	Memory         string // optional: docker --memory for the app container (e.g. "512m")
+	CPUs           string // optional: docker --cpus for the app container (e.g. "1.5")
 }
 
 type deploySession struct {
@@ -57,6 +59,9 @@ func Deploy(inputs []string, flagArgs []string) error {
 		return err
 	}
 	if err := validateLocalArtifacts(cfg); err != nil {
+		return err
+	}
+	if err := validateProductionDB(); err != nil {
 		return err
 	}
 	if err := exec.Command("docker", "inspect", name).Run(); err != nil {
@@ -162,6 +167,10 @@ func loadDeployConfig() (*DeployConfig, error) {
 			cfg.SSLDir = value
 		case "registry_mirror":
 			cfg.RegistryMirror = value
+		case "memory":
+			cfg.Memory = value
+		case "cpus":
+			cfg.CPUs = value
 		default:
 			return nil, fmt.Errorf("%s line %d: unknown key %q", path, n+1, key)
 		}
@@ -215,6 +224,178 @@ func validateLocalArtifacts(cfg *DeployConfig) error {
 	return nil
 }
 
+// validateProductionDB catches the most common deploy-time footgun for
+// projects migrated onto a ric image: a config/database.yml whose production
+// block still has its `database:` paths commented out (the stock Rails
+// template ships them as `# database: path/to/...` placeholders). Left
+// uncommented, db:prepare dies on the server with the cryptic
+// "No database file specified. Missing argument: database".
+//
+// We fail fast, locally, with an actionable message instead of letting it
+// blow up mid-deploy on the remote.
+func validateProductionDB() error {
+	const path = "config/database.yml"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// No database.yml is unusual for a ric app, but not our call to make —
+		// leave it to Rails. Only validate when the file is present.
+		return nil
+	}
+
+	lines := strings.Split(string(data), "\n")
+	inProd := false
+	var haveDatabase, placeholders int
+	for _, line := range lines {
+		// Top-level key (no indentation) ends the production block.
+		if len(line) > 0 && line[0] != ' ' && line[0] != '\t' && line[0] != '#' {
+			inProd = strings.HasPrefix(line, "production:")
+			continue
+		}
+		if !inProd {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "database:"):
+			haveDatabase++
+		case strings.HasPrefix(trimmed, "# database:"),
+			strings.HasPrefix(trimmed, "#database:"):
+			placeholders++
+		}
+	}
+
+	if haveDatabase == 0 && placeholders > 0 {
+		return fmt.Errorf("%s: the production block has commented-out 'database:' paths.\n"+
+			"This is the stock Rails placeholder and will make db:prepare fail on the server with "+
+			"\"No database file specified\".\n"+
+			"Uncomment and set the paths, e.g.:\n"+
+			"  production:\n"+
+			"    primary:\n"+
+			"      <<: *default\n"+
+			"      database: storage/production.sqlite3\n"+
+			"    cache:\n"+
+			"      <<: *default\n"+
+			"      database: storage/production_cache.sqlite3\n"+
+			"      migrations_paths: db/cache_migrate\n"+
+			"    queue:\n"+
+			"      <<: *default\n"+
+			"      database: storage/production_queue.sqlite3\n"+
+			"      migrations_paths: db/queue_migrate\n"+
+			"    cable:\n"+
+			"      <<: *default\n"+
+			"      database: storage/production_cable.sqlite3\n"+
+			"      migrations_paths: db/cable_migrate\n"+
+			"Then run 'ric sync' and deploy again.", path)
+	}
+	return nil
+}
+
+// ensureSQLitePragmas patches the dev container's config/database.yml to add
+// production SQLite pragmas (WAL journal mode etc.) under the `default:`
+// anchor, where all environments and all Solid Trifecta databases inherit
+// them. It reads the file out of the container, transforms it in memory, and
+// writes it back — the developer's host file is left untouched.
+//
+// Idempotent: if pragmas are already present, or the adapter isn't sqlite3,
+// or the file has no `default:` anchor, it does nothing.
+func ensureSQLitePragmas(name string) error {
+	const rel = "config/database.yml"
+	containerPath := "/workspace/" + name + "/" + rel
+
+	out, err := exec.Command("docker", "exec", "-w", "/workspace/"+name, name,
+		"cat", rel).Output()
+	if err != nil {
+		// No database.yml in the container is unusual but not fatal here — the
+		// earlier validateProductionDB ran against the host copy. Skip quietly.
+		return nil
+	}
+
+	patched, changed := addSQLitePragmas(string(out))
+	if !changed {
+		return nil
+	}
+
+	step("Applying SQLite production pragmas (WAL mode)")
+	tmp, err := os.CreateTemp("", name+"-database-*.yml")
+	if err != nil {
+		return fmt.Errorf("create temp database.yml: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(patched); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp database.yml: %w", err)
+	}
+	tmp.Close()
+
+	cp := exec.Command("docker", "cp", tmp.Name(), name+":"+containerPath)
+	cp.Stderr = os.Stderr
+	if err := cp.Run(); err != nil {
+		return fmt.Errorf("copy patched database.yml into %s: %w", name, err)
+	}
+	done("SQLite pragmas applied to the deploy image")
+	return nil
+}
+
+// addSQLitePragmas inserts a `pragmas:` block under the `default: &anchor`
+// mapping of a Rails database.yml. Returns the new content and whether a
+// change was made. Pure function — no I/O — so it can be unit tested.
+//
+// It is conservative: it only acts when the file uses the sqlite3 adapter, has
+// a `default:` anchor, and doesn't already declare `pragmas:`.
+func addSQLitePragmas(yaml string) (string, bool) {
+	if strings.Contains(yaml, "pragmas:") {
+		return yaml, false
+	}
+	if !strings.Contains(yaml, "adapter: sqlite3") {
+		return yaml, false
+	}
+
+	lines := strings.Split(yaml, "\n")
+	anchorIdx := -1
+	for i, line := range lines {
+		// Match a top-level `default:` carrying a YAML anchor (`&default`).
+		if strings.HasPrefix(line, "default:") && strings.Contains(line, "&") {
+			anchorIdx = i
+			break
+		}
+	}
+	if anchorIdx == -1 {
+		return yaml, false
+	}
+
+	// Determine the indentation used for keys inside the default block by
+	// looking at the first indented, non-empty line after the anchor.
+	childIndent := "  "
+	for _, line := range lines[anchorIdx+1:] {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		ws := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+		if ws == "" {
+			break // hit the next top-level key without finding a child
+		}
+		childIndent = ws
+		break
+	}
+	inner := childIndent + childIndent
+
+	block := []string{
+		childIndent + "pragmas:",
+		inner + "journal_mode: WAL",
+		inner + "synchronous: NORMAL",
+		inner + "busy_timeout: 5000",
+		inner + "foreign_keys: true",
+		inner + "cache_size: -64000", // ~64 MB page cache
+		inner + "mmap_size: 134217728", // 128 MB memory-mapped I/O
+	}
+
+	out := make([]string, 0, len(lines)+len(block))
+	out = append(out, lines[:anchorIdx+1]...)
+	out = append(out, block...)
+	out = append(out, lines[anchorIdx+1:]...)
+	return strings.Join(out, "\n"), true
+}
+
 // --- local docker helpers ---
 
 // dockerExec runs `docker exec -w <wd> -e <env...> <container> <cmd...>` and
@@ -233,6 +414,15 @@ func dockerExec(container, workdir string, env []string, cmd ...string) error {
 }
 
 func buildImage(name string) (tarPath, sha string, err error) {
+	// Apply production-grade SQLite pragmas to the container's database.yml
+	// before committing, so the deployed image runs in WAL mode etc. This is
+	// the highest-impact scaling fix for the SQLite + Solid Trifecta stack:
+	// without WAL, a writer blocks all readers and the constant Solid Trifecta
+	// writes cause SQLITE_BUSY stalls under load.
+	if err := ensureSQLitePragmas(name); err != nil {
+		return "", "", err
+	}
+
 	tag := name + ":ric-deploy"
 	commit := exec.Command("docker", "commit", name, tag)
 	commit.Stdout, commit.Stderr = os.Stdout, os.Stderr
@@ -633,6 +823,16 @@ func (s *deploySession) ensureNetwork() error {
 		s.priv("docker network inspect ric-net >/dev/null 2>&1 || docker network create ric-net"))
 }
 
+// Sane Puma defaults for a small single-VPS deploy: 2 worker processes, each
+// with a 3-thread pool → up to 6 concurrent requests. RAILS_MAX_THREADS also
+// sizes the ActiveRecord connection pool. Both are passed as env vars so a
+// project's config/puma.rb ENV.fetch lookups pick them up; a project can still
+// override via its own config if it reads different vars.
+const (
+	defaultWebConcurrency = "2"
+	defaultMaxThreads     = "3"
+)
+
 // appMounts returns the bind-mount + workdir + env args shared by every
 // container ric launches for the app (credgen, db:prepare, the live app).
 // SOLID_QUEUE_IN_PUMA enables Rails 8's puma plugin for solid_queue so the
@@ -643,8 +843,25 @@ func (s *deploySession) appMounts() string {
 		"-v %[1]s/credentials:/workspace/%[2]s/config/credentials "+
 			"-v %[1]s/storage:/workspace/%[2]s/storage "+
 			"-w /workspace/%[2]s "+
-			"-e RAILS_ENV=production -e SOLID_QUEUE_IN_PUMA=true",
-		s.root(), s.name)
+			"-e RAILS_ENV=production -e SOLID_QUEUE_IN_PUMA=true "+
+			"-e WEB_CONCURRENCY=%[3]s -e RAILS_MAX_THREADS=%[4]s",
+		s.root(), s.name, defaultWebConcurrency, defaultMaxThreads)
+}
+
+// resourceFlags returns docker --memory / --cpus flags when the user has set
+// them in .ric/deploy.yml. Empty (unconstrained) by default.
+func (s *deploySession) resourceFlags() string {
+	var parts []string
+	if s.cfg.Memory != "" {
+		parts = append(parts, "--memory "+s.cfg.Memory)
+	}
+	if s.cfg.CPUs != "" {
+		parts = append(parts, "--cpus "+s.cfg.CPUs)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " ") + " "
 }
 
 func (s *deploySession) generateProdCredentials(sha string) error {
@@ -720,9 +937,9 @@ func (s *deploySession) startApp(sha string) error {
 	cmd := fmt.Sprintf(
 		"docker rm -f %[1]s >/dev/null 2>&1; true && "+
 			"docker run -d --name %[1]s --network ric-net --restart unless-stopped "+
-			"%[2]s "+
+			"%[4]s%[2]s "+
 			"%[1]s:%[3]s bin/rails server -b 0.0.0.0 -p 3000",
-		s.name, s.appMounts(), sha)
+		s.name, s.appMounts(), sha, s.resourceFlags())
 	if err := s.ssh("start app container", s.priv(cmd)); err != nil {
 		return fmt.Errorf("could not start app container %s on %s. Run 'docker logs %s' on the server to see why. Underlying: %w",
 			s.name, s.cfg.Host, s.name, err)
