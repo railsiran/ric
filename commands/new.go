@@ -18,7 +18,17 @@ import (
 // It is set at build time via ldflags.
 var BaseURL = "http://localhost:3000"
 
-// loadImage downloads and loads a Docker image, or checks local if --local.
+// imageExistsLocally returns true if `docker image inspect <name>:latest`
+// finds an image already on the host.
+func imageExistsLocally(imageName string) bool {
+	return exec.Command("docker", "image", "inspect", imageName+":latest").Run() == nil
+}
+
+// loadImage picks the right variant image, then makes sure it's available on
+// the local Docker. With --local the image must already be present (error if
+// missing). Without --local, an existing local copy is reused without a
+// download — the network round-trip only happens on a cache miss.
+//
 // The variant is picked from the JS choice (three / p5 / react — each already
 // includes tailwind), falling back to tailwind, falling back to base.
 func loadImage(css, js string, local bool) (string, error) {
@@ -36,11 +46,15 @@ func loadImage(css, js string, local bool) (string, error) {
 
 	if local {
 		fmt.Printf("Checking for local image %s...\n", imageName)
-		cmd := exec.Command("docker", "image", "inspect", imageName+":latest")
-		if err := cmd.Run(); err != nil {
-			return "", fmt.Errorf("local image %s not found: %w", imageName, err)
+		if !imageExistsLocally(imageName) {
+			return "", fmt.Errorf("local image %s:latest not found — drop --local to download it, or build it first", imageName)
 		}
 		fmt.Println("Local image found.")
+		return imageName, nil
+	}
+
+	if imageExistsLocally(imageName) {
+		fmt.Printf("Local image %s:latest already present — skipping download.\n", imageName)
 		return imageName, nil
 	}
 
